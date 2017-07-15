@@ -1,0 +1,693 @@
+#!/usr/bin/env python
+
+from PySide import QtCore, QtGui
+
+from ranchhand.widget.UnassignedWranglingWidget import *
+from ranchhand.widget.LogViewerWidget import *
+from ranchhand.widget.MetadataViewerWidget import *
+from ranchhand.widget.WranglerDialog import *
+from ranchhand.widget.QueueDialog import *
+from ranchhand.widget.TransferTaskDialog import *
+from ranchhand.widget.TakeWrangleItemsDialog import *
+from ranchhand.widget.FinishWrangleItemsDialog import *
+from ranchhand.widget.CommandHistoryWidget import *
+
+from ranchhand.worker.AssignedWrangleListWorker import *
+from ranchhand.worker.QTaskListWorker import *
+from ranchhand.worker.CommandLineWorker import *
+
+from ranchhand import wrangling
+from ranchhand import cqmanage
+
+from ranchhand.style import darkOrangeQSS
+
+from subprocess import check_output
+import collections
+import math
+import colorsys
+import os
+
+class Ranchhand(QtGui.QMainWindow):
+   '''
+      Ranchhand:
+
+      GUI Wrangling tool for the modern artist
+      Uses PySide w/ Qt4.8
+
+      Author: Zachary Shore
+      Contact: zshore@g.clemson.edu
+   '''
+
+   def __init__(self):
+      super(Ranchhand, self).__init__()
+
+      self.wrangle_header_labels = ["Status", "Created", "Frange", "Completed", "Bad", "Wrangle ID"]
+      self.cq_header_labels = ["Status", "Queue", "Started", "Elapsed", "Machine", "QTask ID"]
+
+      self.initUI()
+      self.createActions()
+      self.createMenus()
+
+      self.initThreads()
+
+      self.dispatchAssignedWrangleListWorker()
+
+   def initUI(self):
+
+      ### Brushes ###
+      color = QtGui.QColor()
+      self.brushes = {}
+      color.setNamedColor("#ff00ff")
+      self.brushes["waiting"] = QtGui.QBrush(color)
+
+      color.setNamedColor("#00ff00")
+      self.brushes["running"] = QtGui.QBrush(color)
+
+      color.setNamedColor("#000080")
+      self.brushes["done"] = QtGui.QBrush(color)
+
+      color.setNamedColor("#ff0000")
+      self.brushes["pending"] = QtGui.QBrush(color)
+
+      color.setNamedColor("#fff")
+      self.brushes["unknown"] = QtGui.QBrush(color)
+
+      color.setNamedColor("#ddd")
+      self.brushes["lightgray"] = QtGui.QBrush(color)
+
+      ### Wrangle Items ###
+      self.current_wrangler = wrangling.getCurrentWrangler()
+
+      self.selected_wrangle_items = []
+
+      self.wrangle_tasks_tree_widget = QtGui.QTreeWidget()
+      self.wrangle_tasks_tree_widget.setHeaderLabels(self.wrangle_header_labels)
+      #self.wrangle_tasks_tree_widget.setAlternatingRowColors(True)
+      self.wrangle_tasks_tree_widget.setRootIsDecorated(False)
+      self.wrangle_tasks_tree_widget.setUniformRowHeights(True)
+      self.wrangle_tasks_tree_widget.setSelectionMode(QtGui.QAbstractItemView.ExtendedSelection)
+      self.wrangle_tasks_tree_widget.setSortingEnabled(True)
+      self.wrangle_tasks_tree_widget.sortByColumn(1, QtCore.Qt.AscendingOrder)
+      self.wrangle_tasks_tree_widget.setVerticalScrollMode(QtGui.QAbstractItemView.ScrollPerPixel)
+
+      self.wrangle_tasks_tree_widget.itemSelectionChanged.connect(self.trackSelectedWrangleItems)
+
+      self.wrangling_button_box = QtGui.QDialogButtonBox()
+      self.wrangling_examine_button = self.wrangling_button_box.addButton("Examine", QtGui.QDialogButtonBox.ActionRole)
+      self.wrangling_update_button = self.wrangling_button_box.addButton("Update", QtGui.QDialogButtonBox.ActionRole)
+      self.wrangling_examine_button.clicked.connect(self.examineSelectedWrangleItems)
+      self.wrangling_update_button.clicked.connect(self.dispatchAssignedWrangleListWorker)
+
+      wrangle_splitter = QtGui.QSplitter(QtCore.Qt.Vertical)
+      wrangle_splitter.addWidget(self.wrangle_tasks_tree_widget)
+      wrangle_splitter.setStretchFactor(0, 40)
+
+      wrangle_widget = QtGui.QWidget()
+      wrangle_layout = QtGui.QVBoxLayout()
+      wrangle_layout.setSpacing(4)
+      wrangle_layout.setContentsMargins(4, 4, 4, 4)
+      wrangle_layout.addWidget(wrangle_splitter)
+      wrangle_layout.addWidget(self.wrangling_button_box)
+      wrangle_widget.setLayout(wrangle_layout)
+
+      ### QTasks for Wrangle Item ###
+
+      self.qtasks_tree_widget = QtGui.QTreeWidget()
+      # self.qtasks_tree_widget.setAlternatingRowColors(True)
+      self.qtasks_tree_widget.setHeaderLabels(self.cq_header_labels)
+      self.qtasks_tree_widget.setRootIsDecorated(False)
+      self.qtasks_tree_widget.setUniformRowHeights(True)
+      self.qtasks_tree_widget.setSelectionMode(QtGui.QAbstractItemView.ExtendedSelection)
+      self.qtasks_tree_widget.setSortingEnabled(True)
+      self.qtasks_tree_widget.sortByColumn(1, QtCore.Qt.AscendingOrder)
+      self.qtasks_tree_widget.setVerticalScrollMode(QtGui.QAbstractItemView.ScrollPerPixel)
+
+      self.qtasks_tree_widget.itemSelectionChanged.connect(self.trackSelectedQueueItems)
+
+      self.qtask_button_box = QtGui.QDialogButtonBox()
+      self.qtask_examine_button = self.qtask_button_box.addButton("Examine", QtGui.QDialogButtonBox.ActionRole)
+      self.qtask_update_button = self.qtask_button_box.addButton("Update", QtGui.QDialogButtonBox.ActionRole)
+      self.qtask_examine_button.clicked.connect(self.examineSelectedQTask)
+      self.qtask_update_button.clicked.connect(self.dispatchQTaskListWorker)
+
+      qtask_splitter = QtGui.QSplitter(QtCore.Qt.Vertical)
+      qtask_splitter.addWidget(self.qtasks_tree_widget)
+      qtask_splitter.setStretchFactor(0, 40)
+
+      qtask_widget = QtGui.QWidget()
+      qtask_layout = QtGui.QVBoxLayout()
+      qtask_layout.setSpacing(4)
+      qtask_layout.setContentsMargins(4, 4, 4, 4)
+      qtask_layout.addWidget(qtask_splitter)
+      qtask_layout.addWidget(self.qtask_button_box)
+      qtask_widget.setLayout(qtask_layout)
+
+      ### QTask Info ###
+
+      info_header_labels = ["Info"]
+
+      self.qtask_info_widget = QtGui.QPlainTextEdit()
+      self.qtask_info_widget.setReadOnly(True)
+
+      ### UI ###
+
+      self.progress_bar = QtGui.QProgressBar()
+
+      self.main_splitter = QtGui.QSplitter(QtCore.Qt.Vertical)
+      self.main_splitter.addWidget(wrangle_widget)
+      self.main_splitter.addWidget(qtask_widget)
+      self.main_splitter.addWidget(self.qtask_info_widget)
+      self.main_splitter.addWidget(self.progress_bar)
+      self.main_splitter.setStretchFactor(0, 40)
+      self.main_splitter.setStretchFactor(1, 35)
+      self.main_splitter.setStretchFactor(2, 20)
+      self.main_splitter.setStretchFactor(3, 5)
+
+      self.setCentralWidget(self.main_splitter)
+
+      self.unassigned_wrangling = UnassignedWranglingWidget()
+      self.unassigned_wrangling.new_items_to_grab.valueChanged.connect(self.grabWrangleItems)
+
+      self.logViewer = LogViewerWidget()
+      self.metadataViewer = MetadataViewerWidget()
+
+      self.command_history = CommandHistoryWidget()
+
+      self.setWindowTitle("Ranchhand")
+      self.resize(1200, 1350)
+
+   def initThreads(self):
+      # AssignedWrangleListWorker and thread: used to build assigned wrangling list
+      self.awl_thread = QtCore.QThread()
+      self.awl_worker = AssignedWrangleListWorker(self.current_wrangler)
+      self.awl_worker.moveToThread(self.awl_thread)
+
+      self.awl_worker.updateProgress.connect(self.updateProgressBar)
+      self.awl_worker.jobComplete.connect(self.updateAssignedWrangleList_UI)
+      self.awl_worker.setNumberOfAssigned.connect(self.setProgressBarMaximum)
+      self.awl_worker.workRequested.connect(self.awl_thread.start)
+      self.awl_thread.started.connect(self.awl_worker.process)
+      self.awl_worker.finished.connect(self.awl_thread.quit, Qt.DirectConnection)
+
+      # QTaskListWorker and thread: builds the list of qtasks based on selected wrangle list
+      self.qtask_thread = QtCore.QThread()
+      self.qtask_worker = QTaskListWorker()
+      self.qtask_worker.moveToThread(self.qtask_thread)
+
+      self.qtask_worker.updateProgress.connect(self.updateProgressBar)
+      self.qtask_worker.jobComplete.connect(self.updateQTaskList_UI)
+      self.qtask_worker.setNumberOfQTasks.connect(self.setProgressBarMaximum)
+      self.qtask_worker.workRequested.connect(self.qtask_thread.start)
+      self.qtask_thread.started.connect(self.qtask_worker.process)
+      self.qtask_worker.finished.connect(self.qtask_thread.quit, Qt.DirectConnection)
+
+      # CommandLineWorker and thread: generic terminal command execution in a separate thread
+      self.cmdline_thread = QtCore.QThread()
+      self.cmdline_worker = CommandLineWorker()
+      self.cmdline_worker.moveToThread(self.cmdline_thread)
+
+      self.cmdline_worker.jobComplete.connect(self.updateCommandHistory, Qt.QueuedConnection)
+      self.cmdline_worker.workRequested.connect(self.cmdline_thread.start)
+      self.cmdline_thread.started.connect(self.cmdline_worker.process)
+      self.cmdline_worker.finished.connect(self.cmdline_thread.quit, Qt.DirectConnection)
+
+      # Start command line thread
+      self.cmdline_worker.abort()
+      self.cmdline_thread.wait()
+      self.cmdline_worker.requestWork()
+
+   ### Slots ###
+
+   def trackSelectedWrangleItems(self):
+      self.selected_wrangle_items = self.wrangle_tasks_tree_widget.selectedItems()
+
+   def trackSelectedQueueItems(self):
+      self.selected_queue_items = self.qtasks_tree_widget.selectedItems()
+
+   def examineSelectedWrangleItems(self):
+      self.dispatchQTaskListWorker()
+
+   def dispatchAssignedWrangleListWorker(self):
+      self.awl_worker.abort()
+      self.awl_thread.wait()
+
+      self.awl_worker.setCurrentWrangler(self.current_wrangler)
+      self.awl_worker.requestWork()
+
+   def examineSelectedQTask(self):
+      self.rebuildQTaskInfo()
+
+   def dispatchQTaskListWorker(self):
+      self.qtask_worker.abort()
+      self.qtask_thread.wait()
+
+      self.qtask_worker.setWrangleTaskList(self.selected_wrangle_items)
+      self.qtask_worker.requestWork()
+
+   def dispatchCommandLineTask(self, command, arglist, toqueue, fromqueue, amt):
+      for item in arglist:
+         cmd_task = CommandLineTask()
+         cmd_task.taskid = str(item.text(5)).strip()
+         cmd_task.command = command
+         cmd_task.to_queue = toqueue
+         cmd_task.from_queue = fromqueue
+         cmd_task.transfer_amt = amt
+         cmd_task.history_ndx = self.command_history.appendToHistory(command)
+
+         self.cmdline_worker.addToQueue(cmd_task)
+
+   @QtCore.Slot(int)
+   def setProgressBarMaximum(self, num):
+      self.progress_bar.setMinimum(0)
+      self.progress_bar.setMaximum(num)
+
+   @QtCore.Slot(int)
+   def updateProgressBar(self, num):
+      self.progress_bar.setValue(num)
+
+   @QtCore.Slot(int)
+   def updateCommandHistory(self, ndx):
+      self.command_history.updateItemInHistory(ndx, "Complete", self.brushes["running"])
+
+   @QtCore.Slot(list)
+   def updateAssignedWrangleList_UI(self, wrangle_list):
+      self.wrangle_tasks_tree_widget.clear()
+      self.wrangle_tasks_tree_widget.setHeaderLabels(self.wrangle_header_labels)
+
+      # List:
+      # - Wrangle ID, Frange, Status, Creation Date
+      self.wrangle_items = wrangle_list
+
+      self.wrangle_tree_items = []
+      for wrangle_item in self.wrangle_items:
+         tree_item = QtGui.QTreeWidgetItem( str(wrangle_item[0]) )
+         tree_item.setData( 0, QtCore.Qt.DisplayRole, str(wrangle_item[4]) )
+         tree_item.setData( 1, QtCore.Qt.DisplayRole, str(wrangle_item[5]) )
+         tree_item.setData( 2, QtCore.Qt.DisplayRole, str(wrangle_item[1]) )
+         tree_item.setData( 3, QtCore.Qt.DisplayRole, str(wrangle_item[2]) )
+         tree_item.setData( 4, QtCore.Qt.DisplayRole, str(wrangle_item[3]) )
+         tree_item.setData( 5, QtCore.Qt.DisplayRole, str(wrangle_item[0]) )
+
+         status = str(wrangle_item[4])
+         if status != "waiting" and status != "running" and status != "pending":
+            status = "unknown"
+         tree_item.setForeground( 0, self.brushes[status] )
+         for i in range(1, 6):
+            tree_item.setForeground( i, self.brushes["lightgray"] )
+
+         self.wrangle_tree_items.append(tree_item)
+
+      self.progress_bar.reset()
+      self.wrangle_tasks_tree_widget.addTopLevelItems(self.wrangle_tree_items)
+
+   @QtCore.Slot(list)
+   def updateQTaskList_UI(self, qtask_list):
+      self.qtasks_tree_widget.clear()
+      self.qtasks_tree_widget.setHeaderLabels(self.cq_header_labels)
+
+      self.qtask_tree_items = []
+      for tid in qtask_list:
+         tree_item = QtGui.QTreeWidgetItem( str(tid[0]) )
+         tree_item.setData( 0, QtCore.Qt.DisplayRole, str(tid[2]) )
+         tree_item.setData( 1, QtCore.Qt.DisplayRole, str(tid[1]) )
+         tree_item.setData( 2, QtCore.Qt.DisplayRole, str(tid[4]) )
+         tree_item.setData( 3, QtCore.Qt.DisplayRole, str(tid[5]) )
+         tree_item.setData( 4, QtCore.Qt.DisplayRole, str(tid[3]) )
+         tree_item.setData( 5, QtCore.Qt.DisplayRole, str(tid[0]) )
+
+         status = str(tid[2])
+         if status != "waiting" and status != "running" and status != "done":
+            status = "unknown"
+         tree_item.setForeground( 0, self.brushes[status] )
+         for i in range(1, 6):
+            tree_item.setForeground( i, self.brushes["lightgray"] )
+
+         self.qtask_tree_items.append(tree_item)
+
+      self.progress_bar.reset()
+      self.qtasks_tree_widget.addTopLevelItems(self.qtask_tree_items)
+
+   @QtCore.Slot(int)
+   def grabWrangleItems(self, num):
+      items = self.unassigned_wrangling.selectedWrangleItems()
+      for i in items:
+         wrangling.grabWrangleItem(self.current_wrangler, i)
+
+      self.unassigned_wrangling.buildUnassignedWrangleList()
+      self.dispatchAssignedWrangleListWorker()
+
+   ### Methods ###
+
+   def rebuildQTaskList(self):
+      self.qtasks_tree_widget.clear()
+      self.qtasks_tree_widget.setHeaderLabels(self.cq_header_labels)
+
+      self.qtask_tree_items = []
+      for item in self.selected_wrangle_items:
+
+         wtask = str(item.text(5))
+         frange = str(item.text(2))
+         self.current_qtask_list = cqmanage.qtaskList(wtask, frange)
+
+         for tid in self.current_qtask_list:
+            tree_item = QtGui.QTreeWidgetItem( str(tid[0]) )
+            tree_item.setData( 0, QtCore.Qt.DisplayRole, str(tid[2]) )
+            tree_item.setData( 1, QtCore.Qt.DisplayRole, str(tid[1]) )
+            tree_item.setData( 2, QtCore.Qt.DisplayRole, str(tid[4]) )
+            tree_item.setData( 3, QtCore.Qt.DisplayRole, str(tid[5]) )
+            tree_item.setData( 4, QtCore.Qt.DisplayRole, str(tid[3]) )
+            tree_item.setData( 5, QtCore.Qt.DisplayRole, str(tid[0]) )
+
+            status = str(tid[2])
+            if status != "waiting" and status != "running" and status != "done":
+               status = "unknown"
+            tree_item.setForeground( 0, self.brushes[status] )
+            for i in range(1, 6):
+               tree_item.setForeground( i, self.brushes["lightgray"] )
+
+            self.qtask_tree_items.append(tree_item)
+
+      self.progress_bar.reset()
+      self.qtasks_tree_widget.addTopLevelItems(self.qtask_tree_items)
+
+   def rebuildQTaskInfo(self):
+      qid = self.selected_queue_items[0].text(5)
+      qtaskinfo = check_output(["rhexaminetask", qid])
+      qtaskinfo = qtaskinfo.split("\n")[:-4]
+      qtaskinfo = collections.deque(qtaskinfo)
+      qtaskinfo.rotate(2)
+
+      block = ""
+      for line in qtaskinfo:
+         block = block + line + "\n"
+      self.qtask_info_widget.document().setPlainText(block)
+
+   ### UI Methods ###
+
+   ### Wrangler Actions ###
+
+   def setWrangler(self):
+      wrangler, ok = WranglerDialog.getWrangler()
+      if not ok:
+         return
+
+      self.current_wrangler = str(wrangler)
+      self.dispatchAssignedWrangleListWorker()
+
+   def grabUnassignedWrangleItems(self):
+      self.unassigned_wrangling.buildUnassignedWrangleList()
+      self.unassigned_wrangling.show()
+
+   def releaseWrangleItems(self):
+      if len(self.selected_wrangle_items) == 0:
+         return
+
+      for item in self.selected_wrangle_items:
+         wrangling.releaseWrangleItem( self.current_wrangler, str(item.text(5)) )
+
+      self.selected_wrangle_items = []
+      self.dispatchAssignedWrangleListWorker()
+
+   def giveWrangleItems(self):
+      wrangler, ok = WranglerDialog.getWrangler()
+      if not ok:
+         return
+
+      wrangler = str(wrangler)
+      for item in self.selected_wrangle_items:
+         wrangling.give( wrangler, self.current_wrangler, str(item.text(5)) )
+
+      self.selected_wrangle_items = []
+      self.dispatchAssignedWrangleListWorker()
+
+   def takeWrangleItems(self):
+      wrangler, taskregex, ok = TakeWrangleItemsDialog.getTaskRegex()
+      if not ok:
+         return
+      wrangling.takeByRegex( str(wrangler), self.current_wrangler, str(taskregex) )
+
+   def nukeSequenceFromWrangleItem(self):
+      wrangling.nuke( self.current_wrangler, [str(item.text(5)) for item in self.selected_wrangle_items] )
+
+   def finishWrangleItems(self):
+      status, ok = FinishWrangleItemsDialog.getStatus()
+      if not ok:
+         return
+
+      wrangling.finish( self.current_wrangler, [str(item.text(5)) for item in self.selected_wrangle_items], status )
+      self.dispatchAssignedWrangleListWorker()
+
+   ### CheesyQ Actions ###
+
+   def cqMoveTask(self):
+      moveToQueue, ok = QueueDialog.getQueue()
+      if not ok:
+         return
+
+      self.dispatchCommandLineTask("cqmovetask", self.selected_queue_items, moveToQueue, "", 0)
+
+   def cqHoldTask(self):
+      self.dispatchCommandLineTask("cqholdtask", self.selected_queue_items, "", "", 0)
+
+   def cqDoneTask(self):
+      self.dispatchCommandLineTask("cqdonetask", self.selected_queue_items, "", "", 0)
+
+   def cqStopTask(self):
+      self.dispatchCommandLineTask("cqstop", self.selected_queue_items, "", "", 0)
+
+   def cqTransferTask(self):
+      toqueue, fromqueue, amt, ok = TransferTaskDialog().getTransfer()
+      if not ok:
+         return
+
+      self.dispatchCommandLineTask("cqtransfertask", self.selected_queue_items, toqueue, fromqueue, amt)
+
+   def cqResubmitTask(self):
+      moveToQueue, ok = QueueDialog.getQueue()
+      if not ok:
+         return
+
+      self.dispatchCommandLineTask("cqresubmittask", self.selected_queue_items, moveToQueue, "", 0)
+
+   def cqDisplayFrame(self):
+      for item in self.selected_queue_items:
+         suffix = item.text(5).split("_")[-1]
+         if suffix == "asses" or suffix == "ribs":
+            return
+         else:
+            cqmanage.display(item.text(5))
+
+   def cqViewTaskLog(self):
+      self.logViewer.setQTaskID(self.selected_queue_items[0].text(5))
+      self.logViewer.show()
+
+   def cqViewTaskMetadata(self):
+      self.metadataViewer.setQTaskID(self.selected_queue_items[0].text(5))
+      self.metadataViewer.show()
+
+   def cqViewCommandHistory(self):
+      self.command_history.show()
+
+   ### Admin Actions ###
+
+   def cqClobberTask(self):
+      pass
+
+   def cqStartTaskManager(self):
+      pass
+
+   def cqStopTaskManager(self):
+      pass
+   
+   def cqRestartTaskManager(self):
+      pass
+
+   ### Event Handlers ###
+
+   def closeEvent(self, event):
+      self.shutdown()
+      event.accept()
+
+   ### Misc. Actions ###
+
+   def about(self):
+      rh_desc = """
+Ranchhand is a fancier version of the command line tool cqwrangling. The intent behind Ranchhand was to develop a tool that would be more intuitive to use and less scary than its command line counterpart. 
+
+Ranchhand is still a WIP so everything might not work flawlessly. 
+
+Please contact the pipeline team if you have questions.
+dpa fail works for bug reports.
+
+Developer: Zach Shore
+Email: zshore@g.clemson.edu
+"""
+
+      about_dialog = QtGui.QMessageBox.about(self, "About Ranchhand", rh_desc)
+
+   # Shutdown gracefully
+   def shutdown(self):
+      self.cmdline_worker.abort()
+      self.cmdline_thread.wait()
+
+      self.close()
+
+   def createWranglingActions(self):
+      self.wrangle_set_action = QtGui.QAction("&Set", self,
+            triggered=self.setWrangler)
+
+      self.wrangle_grab_action = QtGui.QAction("&Grab", self,
+            triggered=self.grabUnassignedWrangleItems)
+
+      self.wrangle_release_action = QtGui.QAction("&Release", self,
+            triggered=self.releaseWrangleItems)
+      
+      self.wrangle_give_action = QtGui.QAction("&Give", self,
+            triggered=self.giveWrangleItems)
+      
+      self.wrangle_take_action = QtGui.QAction("&Take", self,
+            triggered=self.takeWrangleItems)
+
+      self.wrangle_finish_action = QtGui.QAction("&Finish", self,
+            triggered=self.finishWrangleItems)
+
+   def createCheesyQActions(self):
+
+      self.cq_move_action = QtGui.QAction("Move", self,
+            triggered=self.cqMoveTask)
+
+      self.cq_hold_action = QtGui.QAction("Hold", self,
+            triggered=self.cqHoldTask)
+
+      self.cq_done_action = QtGui.QAction("Done", self,
+            triggered=self.cqDoneTask)
+
+      self.cq_stop_action = QtGui.QAction("Stop", self,
+            triggered=self.cqStopTask)
+
+      self.cq_transfer_action = QtGui.QAction("Transfer", self,
+            triggered=self.cqTransferTask)
+
+      self.cq_resubmit_action = QtGui.QAction("Resubmit", self,
+            triggered=self.cqResubmitTask)
+
+   def createViewActions(self):
+
+      self.wrangle_nuke_action = QtGui.QAction("&Nuke", self,
+            triggered=self.nukeSequenceFromWrangleItem)
+
+      self.cq_display_action = QtGui.QAction("Display", self,
+            triggered=self.cqDisplayFrame)
+
+      self.cq_log_action = QtGui.QAction("View Log", self,
+            triggered=self.cqViewTaskLog)
+
+      self.cq_metadata_action = QtGui.QAction("Metadata", self,
+            triggered=self.cqViewTaskMetadata)
+
+      self.cq_cmd_history_action = QtGui.QAction("History", self,
+            triggered=self.cqViewCommandHistory)
+
+   def createAdminActions(self):
+
+      self.admin_clobber_action = QtGui.QAction("Clobber", self,
+            triggered=self.cqClobberTask)
+
+      self.admin_cqtm_start_action = QtGui.QAction("Start", self,
+            triggered=self.cqStartTaskManager)
+
+      self.admin_cqtm_stop_action = QtGui.QAction("Stop", self,
+            triggered=self.cqStopTaskManager)
+
+      self.admin_cqtm_restart_action = QtGui.QAction("Restart", self,
+            triggered=self.cqRestartTaskManager)
+
+   def createActions(self):
+      self.createWranglingActions()
+      self.createCheesyQActions()
+      self.createViewActions()
+      self.createAdminActions()
+
+      self.about_action = QtGui.QAction("&About", self, triggered=self.about)
+
+      self.about_Qt_action = QtGui.QAction("About &Qt", self,
+            triggered=QtGui.qApp.aboutQt)
+
+      self.exit_action = QtGui.QAction("E&xit", self, shortcut="Ctrl+Q",
+            triggered=self.shutdown)
+
+   def createMenus(self):
+      self.wrangleMenu = QtGui.QMenu("&Wrangle", self)
+      self.wrangleMenu.addAction(self.wrangle_set_action)
+      self.wrangleMenu.addSeparator()
+      self.wrangleMenu.addAction(self.wrangle_grab_action)
+      self.wrangleMenu.addAction(self.wrangle_release_action)
+      self.wrangleMenu.addAction(self.wrangle_give_action)
+      self.wrangleMenu.addAction(self.wrangle_take_action)
+      self.wrangleMenu.addSeparator()
+      self.wrangleMenu.addAction(self.wrangle_finish_action)
+
+      self.cheesyQMenu = QtGui.QMenu("&CQ", self)
+      self.cheesyQMenu.addAction(self.cq_move_action)
+      self.cheesyQMenu.addAction(self.cq_hold_action)
+      self.cheesyQMenu.addAction(self.cq_done_action)
+      self.cheesyQMenu.addAction(self.cq_stop_action)
+      self.cheesyQMenu.addSeparator()
+      self.cheesyQMenu.addAction(self.cq_transfer_action)
+      self.cheesyQMenu.addAction(self.cq_resubmit_action)
+      self.cheesyQMenu.addSeparator()
+
+      self.viewMenu = QtGui.QMenu("&View", self)
+      self.viewMenu.addAction(self.wrangle_nuke_action)
+      self.viewMenu.addSeparator()
+      self.viewMenu.addAction(self.cq_display_action)
+      self.viewMenu.addAction(self.cq_log_action)
+      self.viewMenu.addAction(self.cq_metadata_action)
+      self.viewMenu.addAction(self.cq_cmd_history_action)
+
+      self.adminMenu = QtGui.QMenu("&Admin", self)
+      self.adminMenu.addAction(self.admin_clobber_action)
+      self.adminMenu.addSeparator()
+      
+      self.cqtmAdminMenu = QtGui.QMenu("CQ Task Manager")
+      self.adminMenu.addMenu(self.cqtmAdminMenu)
+
+      self.cqtmAdminMenu.addAction(self.admin_cqtm_start_action)
+      self.cqtmAdminMenu.addAction(self.admin_cqtm_stop_action)
+      self.cqtmAdminMenu.addAction(self.admin_cqtm_restart_action)
+
+      self.fileMenu = QtGui.QMenu("&File", self)
+      self.fileMenu.addAction(self.about_action)
+      self.fileMenu.addAction(self.about_Qt_action)
+      self.fileMenu.addSeparator()
+      self.fileMenu.addAction(self.exit_action)
+
+      self.menuBar().addMenu(self.fileMenu)
+      self.menuBar().addMenu(self.wrangleMenu)
+      self.menuBar().addMenu(self.cheesyQMenu)
+      self.menuBar().addMenu(self.viewMenu)
+
+   def adjustScrollBar(self, scrollBar, factor):
+      scrollBar.setValue(int(factor * scrollBar.value() + ((factor - 1) * scrollBar.pageStep()/2)))
+
+### End of Ranchhand class
+
+if __name__ == '__main__':
+   import sys
+   import ranchhand
+
+   app = QtGui.QApplication(sys.argv)
+   app.setStyle("plastique")
+   app.setStyleSheet(darkOrangeQSS.style)
+
+   window_icon = QtGui.QIcon()
+   rh_path = os.path.dirname(ranchhand.__file__)
+   window_icon.addFile(os.path.join(rh_path, "images", "WM_Lead_web_The-Outlaw-Josey-Wales-an-army-of-one-poster_scaled-24x24.jpg"), QtCore.QSize(24, 24))
+   window_icon.addFile(os.path.join(rh_path, "images", "WM_Lead_web_The-Outlaw-Josey-Wales-an-army-of-one-poster_scaled-48x48.jpg"), QtCore.QSize(48, 48))
+   window_icon.addFile(os.path.join(rh_path, "images", "WM_Lead_web_The-Outlaw-Josey-Wales-an-army-of-one-poster_scaled-64x64.jpg"), QtCore.QSize(64, 64))
+   window_icon.addFile(os.path.join(rh_path, "images", "WM_Lead_web_The-Outlaw-Josey-Wales-an-army-of-one-poster_scaled-200x200.jpg"), QtCore.QSize(200, 200))
+   app.setWindowIcon(window_icon)
+
+   cowboy = Ranchhand()
+   cowboy.show()
+   sys.exit(app.exec_())
